@@ -1,5 +1,8 @@
 import os
+import re
 import json
+import urllib.request
+import urllib.error
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
@@ -9,19 +12,27 @@ class SmartSaveImage:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
+        self.prefix_append = ""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE",),
+                "images": ("IMAGE", ),
                 "filename_prefix": ("STRING", {"default": "ComfyUI"}),
-                "subfolder": ("STRING", {"default": ""}),
                 "save_raw_png": ("BOOLEAN", {"default": True}),
-                "save_compressed_webp": ("BOOLEAN", {"default": True}),
-                "webp_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+                "save_compressed_jpg": ("BOOLEAN", {"default": True}),
+                "jpg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
             },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+            "optional": {
+                "positive_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
+                "subfolder": ("STRING", {"default": ""}),
+                "ollama_model": ("STRING", {"default": "llama3.2:3b"}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            },
         }
 
     RETURN_TYPES = ()
@@ -29,46 +40,127 @@ class SmartSaveImage:
     OUTPUT_NODE = True
     CATEGORY = "image/saving"
 
-    def save_images(self, images, filename_prefix="ComfyUI", subfolder="", save_raw_png=True, save_compressed_webp=True, webp_quality=90, prompt=None, extra_pnginfo=None):
-        raw_base = os.path.join(self.output_dir, "Raw", subfolder) if subfolder else os.path.join(self.output_dir, "Raw")
-        comp_base = os.path.join(self.output_dir, "Compressed", subfolder) if subfolder else os.path.join(self.output_dir, "Compressed")
+    def _sanitize_folder(self, name):
+        clean = re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
+        clean = clean.replace(" ", "_")
+        return clean if clean else "Unsorted"
 
-        if save_raw_png:
-            os.makedirs(raw_base, exist_ok=True)
-        if save_compressed_webp:
-            os.makedirs(comp_base, exist_ok=True)
+    def _get_subject_from_ollama(self, prompt_text, model="llama3.2:3b"):
+        if not prompt_text or not prompt_text.strip():
+            return "Unsorted"
+
+        url = "http://127.0.0.1:11434/api/generate"
+        system_instruction = (
+            "You are a strict classifier. Extract the primary subject or character name "
+            "from the prompt for a folder directory name. Respond ONLY with the clean name "
+            "(1 to 3 words max). No punctuation, no conversational filler, no formatting."
+        )
+
+        payload = {
+            "model": model,
+            "prompt": f"System: {system_instruction}\nUser Prompt: {prompt_text}\nSubject:",
+            "stream": False
+        }
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                subject = result.get("response", "").strip()
+                # Clean any lingering punctuation or multiple lines
+                subject = subject.split("\n")[0].strip(" .\"'")
+                return self._sanitize_folder(subject) if subject else "Unsorted"
+        except Exception:
+            # Fallback if Ollama isn't running or times out
+            return "Unsorted"
+
+    def _get_next_counter(self, folder_path, prefix, ext):
+        os.makedirs(folder_path, exist_ok=True)
+        existing = [f for f in os.listdir(folder_path) if f.startswith(prefix) and f.endswith(ext)]
+        max_idx = 0
+        pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.{re.escape(ext)}$")
+        for fname in existing:
+            match = pattern.match(fname)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+        return max_idx + 1
+
+    def save_images(
+        self,
+        images,
+        filename_prefix="ComfyUI",
+        save_raw_png=True,
+        save_compressed_jpg=True,
+        jpg_quality=90,
+        positive_prompt="",
+        subfolder="",
+        ollama_model="llama3.2:3b",
+        prompt=None,
+        extra_pnginfo=None,
+        **kwargs
+    ):
+        # 1. Check if user typed an explicit subfolder
+        manual_sub = subfolder.strip()
+
+        if manual_sub:
+            folder_name = self._sanitize_folder(manual_sub)
+        else:
+            # 2. Derive prompt from wired input or fall back to node metadata
+            target_text = positive_prompt.strip()
+            if not target_text and prompt:
+                # Scrape text inputs from graph if no wire attached
+                for node_id, node_data in prompt.items():
+                    inputs = node_data.get("inputs", {})
+                    if "text" in inputs and isinstance(inputs["text"], str):
+                        target_text += " " + inputs["text"]
+
+            # 3. Call local Ollama
+            folder_name = self._get_subject_from_ollama(target_text, model=ollama_model)
 
         results = list()
-        for batch_number, image in enumerate(images):
-            i = 255.0 * image.cpu().numpy()
+
+        for image in images:
+            i = 255. * image.cpu().numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
 
-            metadata = PngInfo()
-            if prompt is not None:
-                metadata.add_text("prompt", json.dumps(prompt))
-            if extra_pnginfo is not None:
-                for x in extra_pnginfo:
-                    metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+            png_filename = None
+            jpg_filename = None
 
-            # Find next free sequential index
-            counter = 1
-            while True:
-                filename = f"{filename_prefix}_{counter:05d}"
-                raw_path = os.path.join(raw_base, f"{filename}.png")
-                comp_path = os.path.join(comp_base, f"{filename}.webp")
-                if not os.path.exists(raw_path) and not os.path.exists(comp_path):
-                    break
-                counter += 1
-
+            # Raw PNG save
             if save_raw_png:
-                img.save(raw_path, pnginfo=metadata, compress_level=4)
+                raw_dir = os.path.join(self.output_dir, "Raw", folder_name)
+                counter = self._get_next_counter(raw_dir, filename_prefix, "png")
+                png_filename = f"{filename_prefix}_{counter:05d}.png"
+                png_path = os.path.join(raw_dir, png_filename)
 
-            if save_compressed_webp:
-                img.save(comp_path, format="WEBP", quality=webp_quality, method=6)
+                metadata = PngInfo()
+                if prompt is not None:
+                    metadata.add_text("prompt", json.dumps(prompt))
+                if extra_pnginfo is not None:
+                    for k, v in extra_pnginfo.items():
+                        metadata.add_text(k, json.dumps(v))
+                if positive_prompt:
+                    metadata.add_text("user_positive_prompt", str(positive_prompt))
+
+                img.save(png_path, pnginfo=metadata, compress_level=4)
+
+            # Compressed JPG save
+            if save_compressed_jpg:
+                comp_dir = os.path.join(self.output_dir, "Compressed", folder_name)
+                counter = self._get_next_counter(comp_dir, filename_prefix, "jpg")
+                jpg_filename = f"{filename_prefix}_{counter:05d}.jpg"
+                jpg_path = os.path.join(comp_dir, jpg_filename)
+
+                rgb_img = img.convert("RGB") if img.mode != "RGB" else img
+                rgb_img.save(jpg_path, "JPEG", quality=jpg_quality, optimize=True)
+
+            primary_filename = png_filename if save_raw_png else (jpg_filename or f"{filename_prefix}.jpg")
+            primary_root = "Raw" if save_raw_png else "Compressed"
 
             results.append({
-                "filename": f"{filename}.png" if save_raw_png else f"{filename}.webp",
-                "subfolder": subfolder,
+                "filename": primary_filename,
+                "subfolder": os.path.join(primary_root, folder_name),
                 "type": self.type
             })
 
