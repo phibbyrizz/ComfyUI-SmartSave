@@ -80,7 +80,8 @@ class SmartSaveImage:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": f"Extract the single primary subject from this prompt:\n{prompt_text}"}
                 ],
-                options={"temperature": 0.0}
+                options={"temperature": 0.0},
+                keep_alive=0  # Instantly evicts model from memory after extraction
             )
             raw_result = response["message"]["content"].strip()
             subject = self.clean_subject_name(raw_result)
