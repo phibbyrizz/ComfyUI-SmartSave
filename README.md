@@ -9,12 +9,30 @@ Analyzes generation prompts using a local LLM via Ollama and automatically route
 2. **Pull the default model**:
    ```bash
    ollama pull llama3.2:3b
-```
 
-## Example Workflow
+🧹 Auto-Sort & Library Cleanup Tool
+Included with the node is a standalone post-processing script (auto_sort.py / run auto sort.bat) that keeps your image generation library clean, organized, and deduplicated.
 
-An import-ready starter setup is provided in `examples/basic_workflow.json`. Drag and drop it directly onto the ComfyUI workspace to inspect the recommended wiring.
+Key Features
+Metadata Subject Classification: Reads ComfyUI generation metadata directly from .png / .jpg files and uses a lightweight local Ollama model (llama3.2:3b) to identify the primary subject.
 
-## Support
+Loose Image Sorting: Scans your output directory (or Raw/Compressed subfolders) and sorts unsorted images into dedicated, sequential character/subject folders.
 
-If this node saves you time and disk-cleaning headaches, consider [buying me a coffee on Ko-fi](https://ko-fi.com/phibby)!
+Smart Folder Consolidator: Automatically detects combination folders (e.g., Ariel and Selena or Taylor Swift & Selena Gomez), merges the files into the primary subject's existing folder with zero index collisions, and deletes the leftover empty folders.
+
+Portable Launcher: run auto sort.bat automatically detects standalone/embedded ComfyUI Python or your system environment.
+
+Quick Start
+Ensure Ollama is running locally with the model installed:
+
+ollama run llama3.2:3b
+
+Double-click run auto sort.bat.
+
+To customize default target directories or add folder overrides, copy config_local.py.example to config_local.py and adjust the paths.
+
+Example Workflow
+An import-ready starter setup is provided in examples/basic_workflow.json. Drag and drop it directly onto the ComfyUI workspace to inspect the recommended wiring.
+
+Support
+If this node saves you time and disk-cleaning headaches, consider buying me a coffee on Ko-fi!

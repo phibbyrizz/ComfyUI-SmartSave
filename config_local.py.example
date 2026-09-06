@@ -1,0 +1,7 @@
+from pathlib import Path
+
+# Optional: Set custom output folder
+# BASE_DIR = Path(r"C:\Path\To\Your\Output")
+
+# Optional: Specify category subfolders
+# CATEGORIES = ["Raw", "Compressed"]
