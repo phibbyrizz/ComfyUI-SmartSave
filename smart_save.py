@@ -1,11 +1,11 @@
 import os
 import re
 import json
+import folder_paths
+import ollama
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-import folder_paths
-import ollama
 
 # In-memory session cache to prevent repeated Ollama calls for identical prompts
 PROMPT_CACHE = {}
@@ -14,6 +14,7 @@ class SmartSaveImage:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
+        self.prefix_append = ""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -35,18 +36,40 @@ class SmartSaveImage:
     RETURN_TYPES = ()
     FUNCTION = "save_images"
     OUTPUT_NODE = True
-    CATEGORY = "SmartSave"
+    CATEGORY = "image/saving"
 
-    def _extract_subject(self, prompt_text: str, model: str) -> str:
-        cached = PROMPT_CACHE.get(prompt_text)
-        if cached:
-            return cached
+    def clean_subject_name(self, raw_subject):
+        """Deterministically strips conjunctions, punctuation, and invalid chars."""
+        if not raw_subject:
+            return "Misc"
+
+        subject = raw_subject.strip()
+
+        # Hard clamp: Split on conjunctions or separators if the LLM slipped
+        delimiters = r"\s+(?:and|&|with)\s+|,|\+"
+        parts = re.split(delimiters, subject, flags=re.IGNORECASE)
+        if parts:
+            subject = parts[0].strip()
+
+        # Strip illegal filesystem characters for Windows/Linux
+        subject = re.sub(r'[\\/*?:"<>|]', "", subject)
+        
+        # Replace remaining whitespace cleanly
+        subject = re.sub(r"\s+", "_", subject).strip("._ ")
+
+        return subject if subject else "Misc"
+
+    def query_ollama(self, prompt_text, model):
+        """Sends the generation prompt to Ollama with strict single-subject constraints."""
+        if prompt_text in PROMPT_CACHE:
+            return PROMPT_CACHE[prompt_text]
 
         system_instruction = (
-            "Extract the primary subject or character name from the prompt. "
-            "Respond ONLY with the name (1-3 words maximum, title case). "
-            "Do not include style terms, lighting, camera angles, or explanations. "
-            "If no distinct subject is found, respond with: Miscellaneous"
+            "You are a file classifier. Extract the SINGLE primary subject or character name from the prompt.\n"
+            "Rules:\n"
+            "1. If multiple people, characters, or subjects are listed, pick ONLY the first one mentioned in the text.\n"
+            "2. NEVER combine names using words like 'and', 'with', '&', or commas.\n"
+            "3. Return ONLY the single name (1 to 3 words maximum), with no explanation, punctuation, quotes, or markdown."
         )
 
         try:
@@ -54,99 +77,76 @@ class SmartSaveImage:
                 model=model,
                 messages=[
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt_text}
+                    {"role": "user", "content": f"Extract the single primary subject from this prompt:\n{prompt_text}"}
                 ],
                 options={"temperature": 0.0}
             )
-            raw_result = response.get("message", {}).get("content", "").strip()
-            
-            # Sanitize output: remove invalid filesystem characters
-            clean_name = re.sub(r'[\\/*?:"<>|]', '', raw_result).strip()
-            clean_name = clean_name.replace(".", "").strip()
-            
-            if not clean_name:
-                clean_name = "Miscellaneous"
-                
-        except Exception as err:
-            print(f"[SmartSave] Ollama extraction failed ({err}), falling back to 'Miscellaneous'")
-            clean_name = "Miscellaneous"
+            raw_result = response["message"]["content"].strip()
+            subject = self.clean_subject_name(raw_result)
+        except Exception as e:
+            print(f"[SmartSave Warning] Ollama query failed: {e}. Falling back to 'Misc'.")
+            subject = "Misc"
 
-        PROMPT_CACHE[prompt_text] = clean_name
-        return clean_name
+        PROMPT_CACHE[prompt_text] = subject
+        return subject
 
-    def _get_next_index(self, folder_path: str, base_filename: str) -> int:
-        os.makedirs(folder_path, exist_ok=True)
-        max_idx = 0
-        pattern = re.compile(rf"^{re.escape(base_filename)}_(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
+    def save_images(self, images, positive_prompt, format="PNG", subfolder_prefix="", quality=95, ollama_model="llama3.2:3b", prompt=None, extra_pnginfo=None):
+        subject_folder = self.query_ollama(positive_prompt, ollama_model)
 
-        for filename in os.listdir(folder_path):
-            match = pattern.match(filename)
-            if match:
-                idx = int(match.group(1))
-                if idx > max_idx:
-                    max_idx = idx
-
-        return max_idx + 1
-
-    def save_images(
-        self,
-        images,
-        positive_prompt: str,
-        format: str = "PNG",
-        subfolder_prefix: str = "",
-        quality: int = 95,
-        ollama_model: str = "llama3.2:3b",
-        prompt=None,
-        extra_pnginfo=None
-    ):
-        subject = self._extract_subject(positive_prompt, ollama_model)
-
-        prefix = subfolder_prefix.strip().strip("/\\")
-        if prefix:
-            target_dir = os.path.join(self.output_dir, prefix, subject)
+        # Build subfolder path
+        if subfolder_prefix.strip():
+            subfolder = os.path.join(subfolder_prefix.strip(), subject_folder)
         else:
-            target_dir = os.path.join(self.output_dir, subject)
+            subfolder = subject_folder
 
-        next_idx = self._get_next_index(target_dir, subject)
+        target_dir = os.path.join(self.output_dir, subfolder)
+        os.makedirs(target_dir, exist_ok=True)
+
+        ext = format.lower()
+
+        # Sequence counting
+        existing_files = os.listdir(target_dir)
+        indices = []
+        pattern = re.compile(rf"^{re.escape(subject_folder)}_(\d+)\.{ext}$")
+        for f in existing_files:
+            match = pattern.match(f)
+            if match:
+                indices.append(int(match.group(1)))
+        
+        counter = max(indices) + 1 if indices else 1
 
         results = []
-
         for image in images:
             i = 255.0 * image.cpu().numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
 
-            file_stem = f"{subject}_{next_idx:04d}"
+            filename = f"{subject_folder}_{counter:04d}.{ext}"
+            filepath = os.path.join(target_dir, filename)
 
-            if format == "PNG":
-                filename = f"{file_stem}.png"
-                filepath = os.path.join(target_dir, filename)
-
+            if ext == "png":
                 metadata = PngInfo()
                 if prompt is not None:
                     metadata.add_text("prompt", json.dumps(prompt))
                 if extra_pnginfo is not None:
                     for k, v in extra_pnginfo.items():
                         metadata.add_text(k, json.dumps(v))
-
                 img.save(filepath, pnginfo=metadata, compress_level=4)
-
             else:
-                filename = f"{file_stem}.jpg"
-                filepath = os.path.join(target_dir, filename)
-                
-                # Convert RGBA to RGB for JPEG compatibility
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                    
-                img.save(filepath, quality=quality, optimize=True)
+                img.save(filepath, quality=quality)
 
-            subfolder_out = os.path.relpath(target_dir, self.output_dir)
             results.append({
                 "filename": filename,
-                "subfolder": subfolder_out,
+                "subfolder": subfolder,
                 "type": self.type
             })
-
-            next_idx += 1
+            counter += 1
 
         return {"ui": {"images": results}}
+
+NODE_CLASS_MAPPINGS = {
+    "SmartSaveImage": SmartSaveImage
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SmartSaveImage": "Smart LLM Save Image"
+}
