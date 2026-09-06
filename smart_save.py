@@ -6,6 +6,7 @@ import ollama
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+import piexif
 
 # In-memory session cache to prevent repeated Ollama calls for identical prompts
 PROMPT_CACHE = {}
@@ -132,7 +133,31 @@ class SmartSaveImage:
                         metadata.add_text(k, json.dumps(v))
                 img.save(filepath, pnginfo=metadata, compress_level=4)
             else:
-                img.save(filepath, quality=quality)
+                metadata = {}
+                if prompt is not None:
+                    metadata["prompt"] = prompt
+                if extra_pnginfo is not None:
+                    metadata.update(extra_pnginfo)
+
+                exif_bytes = None
+                if metadata:
+                    user_comment = b"UNICODE\x00" + json.dumps(metadata).encode("utf-16le")
+                    exif_dict = {
+                        "0th": {},
+                        "Exif": {piexif.ExifIFD.UserComment: user_comment},
+                        "GPS": {},
+                        "1st": {},
+                        "thumbnail": None,
+                    }
+                    try:
+                        exif_bytes = piexif.dump(exif_dict)
+                    except Exception as e:
+                        print(f"[SmartSave Warning] Failed to pack EXIF metadata: {e}")
+
+                if exif_bytes:
+                    img.save(filepath, format="JPEG", quality=quality, exif=exif_bytes)
+                else:
+                    img.save(filepath, format="JPEG", quality=quality)
 
             results.append({
                 "filename": filename,
