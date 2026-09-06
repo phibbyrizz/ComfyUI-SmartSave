@@ -8,7 +8,6 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 import piexif
 
-# In-memory session cache to prevent repeated Ollama calls for identical prompts
 PROMPT_CACHE = {}
 
 class SmartSaveImage:
@@ -40,37 +39,65 @@ class SmartSaveImage:
     CATEGORY = "image/saving"
 
     def clean_subject_name(self, raw_subject):
-        """Deterministically strips conjunctions, punctuation, and invalid chars."""
+        """Deterministically strips conjunctions, punctuation, and invalid characters."""
         if not raw_subject:
             return "Misc"
 
         subject = raw_subject.strip()
 
-        # Hard clamp: Split on conjunctions or separators if the LLM slipped
+        # Hard clamp: Split on conjunctions between distinct multiple people
         delimiters = r"\s+(?:and|&|with)\s+|,|\+"
         parts = re.split(delimiters, subject, flags=re.IGNORECASE)
         if parts:
             subject = parts[0].strip()
 
-        # Strip illegal filesystem characters for Windows/Linux
+        # Remove illegal file characters
         subject = re.sub(r'[\\/*?:"<>|]', "", subject)
         
-        # Replace remaining whitespace cleanly
-        subject = re.sub(r"\s+", "_", subject).strip("._ ")
+        # Standardize spaces cleanly
+        subject = re.sub(r"[\s_]+", " ", subject).strip("._ ")
 
-        return subject if subject else "Misc"
+        return subject.title() if subject else "Misc"
+
+    def resolve_existing_folder(self, base_dir, subject):
+        """Matches against existing folders ignoring case, spaces, and underscores.
+        Attaches single first-names (e.g. 'Billie') to full names (e.g. 'Billie Eilish')."""
+        if not os.path.exists(base_dir):
+            return subject
+
+        existing_folders = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+
+        def normalize(name):
+            return re.sub(r'[\s_]+', '', name).lower()
+
+        norm_subject = normalize(subject)
+
+        # 1. Exact normalized match (e.g., 'billie_eilish' matches 'Billie Eilish')
+        for folder in existing_folders:
+            if normalize(folder) == norm_subject:
+                return folder
+
+        # 2. First-name prefix match (e.g., 'Billie' routes to existing 'Billie Eilish')
+        for folder in existing_folders:
+            norm_folder = normalize(folder)
+            if norm_folder.startswith(norm_subject):
+                return folder
+
+        # 3. Default to clean Title Case with spaces
+        return subject.replace("_", " ").title()
 
     def query_ollama(self, prompt_text, model):
-        """Sends the generation prompt to Ollama with strict single-subject constraints."""
+        """Extracts the complete name of the first primary subject."""
         if prompt_text in PROMPT_CACHE:
             return PROMPT_CACHE[prompt_text]
 
         system_instruction = (
-            "You are a file classifier. Extract the SINGLE primary subject or character name from the prompt.\n"
+            "You are a file naming classifier. Extract the complete name of the FIRST subject or character mentioned in the prompt.\n"
             "Rules:\n"
-            "1. If multiple people, characters, or subjects are listed, pick ONLY the first one mentioned in the text.\n"
-            "2. NEVER combine names using words like 'and', 'with', '&', or commas.\n"
-            "3. Return ONLY the single name (1 to 3 words maximum), with no explanation, punctuation, quotes, or markdown."
+            "1. Always include BOTH the first and last name if provided (e.g., 'Selena Gomez', not just 'Selena').\n"
+            "2. If multiple characters or subjects appear, output ONLY the first one.\n"
+            "3. Do NOT include conjunctions like 'and', 'with', or '&'.\n"
+            "4. Return ONLY the name (maximum 3 words), with zero extra words, quotes, or punctuation."
         )
 
         try:
@@ -78,10 +105,10 @@ class SmartSaveImage:
                 model=model,
                 messages=[
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": f"Extract the single primary subject from this prompt:\n{prompt_text}"}
+                    {"role": "user", "content": f"Extract the full name of the first primary subject from this prompt:\n{prompt_text}"}
                 ],
                 options={"temperature": 0.0},
-                keep_alive=0  # Instantly evicts model from memory after extraction
+                keep_alive=0  # Frees Ollama from memory immediately after execution
             )
             raw_result = response["message"]["content"].strip()
             subject = self.clean_subject_name(raw_result)
@@ -93,23 +120,30 @@ class SmartSaveImage:
         return subject
 
     def save_images(self, images, positive_prompt, format="PNG", subfolder_prefix="", quality=95, ollama_model="llama3.2:3b", prompt=None, extra_pnginfo=None):
-        subject_folder = self.query_ollama(positive_prompt, ollama_model)
+        raw_subject = self.query_ollama(positive_prompt, ollama_model)
 
-        # Build subfolder path
+        # Base parent path
+        parent_dir = os.path.join(self.output_dir, subfolder_prefix.strip()) if subfolder_prefix.strip() else self.output_dir
+
+        # Match against existing folders to prevent First vs Full Name splits
+        subject_folder = self.resolve_existing_folder(parent_dir, raw_subject)
+
         if subfolder_prefix.strip():
+            target_dir = os.path.join(parent_dir, subject_folder)
             subfolder = os.path.join(subfolder_prefix.strip(), subject_folder)
         else:
+            target_dir = os.path.join(self.output_dir, subject_folder)
             subfolder = subject_folder
 
-        target_dir = os.path.join(self.output_dir, subfolder)
         os.makedirs(target_dir, exist_ok=True)
-
         ext = format.lower()
 
-        # Sequence counting
+        # Clean base name for filenames (uses underscores for cross-platform compatibility)
+        file_base_prefix = subject_folder.replace(" ", "_")
+
         existing_files = os.listdir(target_dir)
         indices = []
-        pattern = re.compile(rf"^{re.escape(subject_folder)}_(\d+)\.{ext}$")
+        pattern = re.compile(rf"^{re.escape(file_base_prefix)}_(\d+)\.{ext}$")
         for f in existing_files:
             match = pattern.match(f)
             if match:
@@ -122,7 +156,7 @@ class SmartSaveImage:
             i = 255.0 * image.cpu().numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
 
-            filename = f"{subject_folder}_{counter:04d}.{ext}"
+            filename = f"{file_base_prefix}_{counter:04d}.{ext}"
             filepath = os.path.join(target_dir, filename)
 
             if ext == "png":
