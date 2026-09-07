@@ -4,12 +4,49 @@ import json
 import shutil
 import time
 import argparse
-import subprocess
 from PIL import Image
 import piexif
 import ollama
 
 PROMPT_CACHE = {}
+ALIASES = {}
+
+def load_aliases(script_dir):
+    """Loads aliases.json if present in the script directory or parent directory."""
+    global ALIASES
+    possible_paths = [
+        os.path.join(script_dir, "aliases.json"),
+        os.path.join(script_dir, "..", "aliases.json"),
+    ]
+    for path in possible_paths:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # Normalize keys for case-insensitive lookup
+                    ALIASES = {k.strip().lower().replace(" ", "_"): v.strip() for k, v in data.items()}
+                print(f"Loaded {len(ALIASES)} alias mappings from {os.path.abspath(path)}")
+                return
+            except Exception as e:
+                print(f"Warning: Failed to parse {path}: {e}")
+
+def normalize_entity_name(raw_name: str) -> str:
+    """Normalizes an extracted subject name to strict FirstName_LastName format."""
+    cleaned = raw_name.strip()
+    lookup_key = cleaned.lower().replace(" ", "_")
+    
+    # 1. Alias lookup
+    if lookup_key in ALIASES:
+        return ALIASES[lookup_key]
+
+    # 2. Strip non-alphanumeric characters (keep hyphens and spaces)
+    safe = re.sub(r'[^\w\s-]', '', cleaned)
+    
+    # 3. Format as Title_Case with underscores
+    parts = safe.split()
+    if not parts:
+        return "Misc"
+    return "_".join(part.capitalize() for part in parts)
 
 def extract_prompt_from_image(filepath):
     """Pulls human positive prompt text from PNG chunks or EXIF user comments."""
@@ -17,6 +54,12 @@ def extract_prompt_from_image(filepath):
         with Image.open(filepath) as img:
             ext = os.path.splitext(filepath)[1].lower()
             if ext == ".png":
+                # Check for explicit positive prompt first (saved by SmartSaveImage)
+                if "user_positive_prompt" in img.info:
+                    val = img.info["user_positive_prompt"].strip()
+                    if len(val) > 2:
+                        return val
+
                 for key in ["prompt", "parameters", "workflow"]:
                     if key in img.info:
                         raw = img.info[key]
@@ -90,8 +133,7 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
         else:
             parts = re.split(r"\s+(?:and|&|with)\s+|,|\+", raw_result, flags=re.IGNORECASE)
             cleaned = parts[0].strip() if parts else raw_result
-            cleaned = re.sub(r'[\\/*?:"<>|.\']', "", cleaned).strip()
-            subject = cleaned.title() if len(cleaned) > 1 else "Misc"
+            subject = normalize_entity_name(cleaned)
     except Exception:
         subject = "Misc"
 
@@ -104,13 +146,31 @@ def determine_subject(filename, filepath, generic_prefixes, model):
     norm = base_clean.lower()
 
     if not any(norm.startswith(p) for p in generic_prefixes) and len(base_clean) > 2:
-        return base_clean.title()
+        return normalize_entity_name(base_clean)
 
     prompt = extract_prompt_from_image(filepath)
     if prompt:
         return query_ollama(prompt, model=model)
 
     return "Misc"
+
+def get_next_indexed_path(dest_folder, subject, ext):
+    """Finds the next sequential <Subject>_00001.ext index in the destination folder."""
+    os.makedirs(dest_folder, exist_ok=True)
+    existing_files = os.listdir(dest_folder)
+    highest_idx = 0
+    pattern = re.compile(rf"^{re.escape(subject)}_(\d+){re.escape(ext)}$", re.IGNORECASE)
+    
+    for f in existing_files:
+        match = pattern.match(f)
+        if match:
+            idx = int(match.group(1))
+            if idx > highest_idx:
+                highest_idx = idx
+                
+    next_idx = highest_idx + 1
+    new_filename = f"{subject}_{next_idx:05d}{ext}"
+    return os.path.join(dest_folder, new_filename)
 
 def safe_move(src, dst):
     for _ in range(5):
@@ -120,6 +180,17 @@ def safe_move(src, dst):
         except PermissionError:
             time.sleep(0.2)
     return False
+
+def prune_empty_dirs(target_dir):
+    """Removes empty directories bottom-up in a platform-independent way."""
+    for root, dirs, files in os.walk(target_dir, topdown=False):
+        for d in dirs:
+            dir_path = os.path.join(root, d)
+            try:
+                if not os.listdir(dir_path):
+                    os.rmdir(dir_path)
+            except OSError:
+                pass
 
 def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
     raw_dir = os.path.join(target_dir, "Raw")
@@ -145,18 +216,12 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
 
         subject = determine_subject(filename, filepath, generic_prefixes, model)
         dest_folder = os.path.join(dest_root, subject)
-        os.makedirs(dest_folder, exist_ok=True)
-        dest_path = os.path.join(dest_folder, filename)
+        
+        # Determine strict sequential path (<Subject>_00001.ext)
+        dest_path = get_next_indexed_path(dest_folder, subject, ext)
 
         if os.path.abspath(filepath) == os.path.abspath(dest_path):
             continue
-
-        if os.path.exists(dest_path):
-            b, e = os.path.splitext(filename)
-            counter = 1
-            while os.path.exists(dest_path):
-                dest_path = os.path.join(dest_folder, f"{b}_{counter}{e}")
-                counter += 1
 
         if safe_move(filepath, dest_path):
             rel_dst = os.path.relpath(dest_path, target_dir)
@@ -165,8 +230,7 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
     if purge_empty:
         for parent in [raw_dir, compressed_dir, target_dir]:
             if os.path.exists(parent):
-                cmd = f'cmd /c "cd /d "{parent}" && for /f "delims=" %d in (\'dir /s /b /ad ^| sort /r\') do rd "%d" 2>nul"'
-                subprocess.run(cmd, shell=True)
+                prune_empty_dirs(parent)
 
     print("Sorting complete.")
 
@@ -176,5 +240,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="llama3.2:3b", help="Ollama model tag")
     parser.add_argument("--no-purge", action="store_true", help="Skip purging empty directories")
     args = parser.parse_args()
+
+    script_directory = os.path.dirname(os.path.abspath(__file__))
+    load_aliases(script_directory)
 
     sort_directory(args.dir, model=args.model, purge_empty=not args.no_purge)

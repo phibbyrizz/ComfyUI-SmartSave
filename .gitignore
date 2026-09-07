@@ -141,21 +141,37 @@ cython_debug/
 # ComfyUI-SmartSave Project Overrides
 # ==========================================
 
-# Local personal overrides & test scripts
-config_local.py
+# Temporary inspection & test scripts
+inspect_meta.py
+*test*.py
+
+# Personal/local maintenance utilities & batch runners
 total_resort.py
+run_total_resort*.bat
+run_total_resort*
+config_local.py
 prune_empty.py
 recover.py
 *cleanup*.py
-*test*.py
+
+# Local batch runners with spaces/custom names
+*.bat
+
+# Personal alias overrides & JSON caches
 aliases.json
+aliases.local.json
+prompt_cache.json
+*.cache.json
+
+# Image formats (keeps accidental test renders out of the repo)
+*.png
+*.jpg
+*.jpeg
+*.webp
 
 # Windows system & explorer cache artifacts
 Thumbs.db
 thumbs.db
 desktop.ini
 $RECYCLE.BIN/
-
 # Local prompt caches & personal subject data
-*.json
-!requirements*.json
