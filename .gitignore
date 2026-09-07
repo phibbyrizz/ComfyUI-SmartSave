@@ -148,6 +148,7 @@ prune_empty.py
 recover.py
 *cleanup*.py
 *test*.py
+aliases.json
 
 # Windows system & explorer cache artifacts
 Thumbs.db
