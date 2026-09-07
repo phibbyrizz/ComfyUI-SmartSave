@@ -46,20 +46,28 @@ class SmartSaveImage:
         return clean if clean else "Unsorted"
 
     def _get_subject_from_ollama(self, prompt_text, model="llama3.2:3b"):
+        print(f"\n[SmartSave Debug] Incoming Text to Ollama:\n'''{prompt_text}'''\n")
+
         if not prompt_text or not prompt_text.strip():
+            print("[SmartSave Debug] Prompt empty -> routing to Unsorted")
             return "Unsorted"
 
         url = "http://127.0.0.1:11434/api/generate"
         system_instruction = (
-            "You are a strict classifier. Extract the primary subject or character name "
-            "from the prompt for a folder directory name. Respond ONLY with the clean name "
-            "(1 to 3 words max). No punctuation, no conversational filler, no formatting."
+            "You are a strict entity extractor for file organization. "
+            "Identify the PRIMARY CHARACTER, PERSON, or MAIN OBJECT in the prompt. "
+            "Ignore art style, quality words, and descriptors like 'cartoon', 'realistic', 'anime', 'photo', '3d'. "
+            "If a specific character or figure is present, return ONLY their proper name. "
+            "Respond ONLY with the name (1-3 words). No punctuation, no quotes, no extra words."
         )
 
         payload = {
             "model": model,
-            "prompt": f"System: {system_instruction}\nUser Prompt: {prompt_text}\nSubject:",
-            "stream": False
+            "prompt": f"System: {system_instruction}\nPrompt: {prompt_text}\nPrimary Character or Subject:",
+            "stream": False,
+            "options": {
+                "temperature": 0.0
+            }
         }
 
         try:
@@ -68,11 +76,12 @@ class SmartSaveImage:
             with urllib.request.urlopen(req, timeout=5) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 subject = result.get("response", "").strip()
-                # Clean any lingering punctuation or multiple lines
                 subject = subject.split("\n")[0].strip(" .\"'")
-                return self._sanitize_folder(subject) if subject else "Unsorted"
-        except Exception:
-            # Fallback if Ollama isn't running or times out
+                folder = self._sanitize_folder(subject) if subject else "Unsorted"
+                print(f"[SmartSave] Ollama classified subject as: '{folder}'")
+                return folder
+        except Exception as e:
+            print(f"[SmartSave] Ollama request failed: {e}")
             return "Unsorted"
 
     def _get_next_counter(self, folder_path, prefix, ext):
@@ -100,22 +109,18 @@ class SmartSaveImage:
         extra_pnginfo=None,
         **kwargs
     ):
-        # 1. Check if user typed an explicit subfolder
         manual_sub = subfolder.strip()
 
         if manual_sub:
             folder_name = self._sanitize_folder(manual_sub)
         else:
-            # 2. Derive prompt from wired input or fall back to node metadata
             target_text = positive_prompt.strip()
             if not target_text and prompt:
-                # Scrape text inputs from graph if no wire attached
                 for node_id, node_data in prompt.items():
                     inputs = node_data.get("inputs", {})
                     if "text" in inputs and isinstance(inputs["text"], str):
                         target_text += " " + inputs["text"]
 
-            # 3. Call local Ollama
             folder_name = self._get_subject_from_ollama(target_text, model=ollama_model)
 
         results = list()
@@ -127,12 +132,13 @@ class SmartSaveImage:
             png_filename = None
             jpg_filename = None
 
-            # Raw PNG save
             if save_raw_png:
                 raw_dir = os.path.join(self.output_dir, "Raw", folder_name)
                 counter = self._get_next_counter(raw_dir, filename_prefix, "png")
                 png_filename = f"{filename_prefix}_{counter:05d}.png"
                 png_path = os.path.join(raw_dir, png_filename)
+
+                print(f"[SmartSave] Saved Raw PNG -> {png_path}")
 
                 metadata = PngInfo()
                 if prompt is not None:
@@ -145,12 +151,13 @@ class SmartSaveImage:
 
                 img.save(png_path, pnginfo=metadata, compress_level=4)
 
-            # Compressed JPG save
             if save_compressed_jpg:
                 comp_dir = os.path.join(self.output_dir, "Compressed", folder_name)
                 counter = self._get_next_counter(comp_dir, filename_prefix, "jpg")
                 jpg_filename = f"{filename_prefix}_{counter:05d}.jpg"
                 jpg_path = os.path.join(comp_dir, jpg_filename)
+
+                print(f"[SmartSave] Saved Compressed JPG -> {jpg_path}")
 
                 rgb_img = img.convert("RGB") if img.mode != "RGB" else img
                 rgb_img.save(jpg_path, "JPEG", quality=jpg_quality, optimize=True)
