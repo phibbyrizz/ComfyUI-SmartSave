@@ -11,6 +11,9 @@ import ollama
 PROMPT_CACHE = {}
 ALIASES = {}
 
+VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
+PROTECTED_FOLDER_NAMES = {"video", "videos", "renders", "smartsave", "h3"}
+
 def load_aliases(script_dir):
     """Loads aliases.json if present in the script directory or parent directory."""
     global ALIASES
@@ -23,7 +26,6 @@ def load_aliases(script_dir):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    # Normalize keys for case-insensitive lookup
                     ALIASES = {k.strip().lower().replace(" ", "_"): v.strip() for k, v in data.items()}
                 print(f"Loaded {len(ALIASES)} alias mappings from {os.path.abspath(path)}")
                 return
@@ -35,18 +37,37 @@ def normalize_entity_name(raw_name: str) -> str:
     cleaned = raw_name.strip()
     lookup_key = cleaned.lower().replace(" ", "_")
     
-    # 1. Alias lookup
     if lookup_key in ALIASES:
         return ALIASES[lookup_key]
 
-    # 2. Strip non-alphanumeric characters (keep hyphens and spaces)
     safe = re.sub(r'[^\w\s-]', '', cleaned)
-    
-    # 3. Format as Title_Case with underscores
     parts = safe.split()
     if not parts:
         return "Misc"
     return "_".join(part.capitalize() for part in parts)
+
+def is_video_companion_or_protected(filepath: str) -> bool:
+    """Checks if the file is a metadata poster, inside a video directory, or paired with a video."""
+    folder, filename = os.path.split(filepath)
+    
+    # 1. Skip if the file is inside a dedicated video folder
+    folder_parts = {p.lower() for p in re.split(r'[\\/]', folder)}
+    if folder_parts.intersection(PROTECTED_FOLDER_NAMES):
+        return True
+
+    base, _ = os.path.splitext(filename)
+
+    # 2. Check for matching video sibling in the same folder
+    # e.g., "Batman_00009_workflow.jpg" or "Batman_00009.png" -> check for "Batman_00009.mp4"
+    clean_base = re.sub(r'(_workflow|_preview)$', '', base, flags=re.IGNORECASE)
+    
+    for vid_ext in VIDEO_EXTS:
+        if os.path.exists(os.path.join(folder, f"{clean_base}{vid_ext}")):
+            return True
+        if os.path.exists(os.path.join(folder, f"{base}{vid_ext}")):
+            return True
+
+    return False
 
 def extract_prompt_from_image(filepath):
     """Pulls human positive prompt text from PNG chunks or EXIF user comments."""
@@ -54,7 +75,6 @@ def extract_prompt_from_image(filepath):
         with Image.open(filepath) as img:
             ext = os.path.splitext(filepath)[1].lower()
             if ext == ".png":
-                # Check for explicit positive prompt first (saved by SmartSaveImage)
                 if "user_positive_prompt" in img.info:
                     val = img.info["user_positive_prompt"].strip()
                     if len(val) > 2:
@@ -202,12 +222,20 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
     valid_exts = (".png", ".jpg", ".jpeg", ".webp")
 
     all_files = []
+    skipped_count = 0
+
     for root, _, files in os.walk(target_dir):
         for f in files:
             if f.lower().endswith(valid_exts):
-                all_files.append(os.path.join(root, f))
+                full_path = os.path.join(root, f)
+                if is_video_companion_or_protected(full_path):
+                    skipped_count += 1
+                    continue
+                all_files.append(full_path)
 
-    print(f"Scanning and sorting {len(all_files)} images...")
+    if skipped_count:
+        print(f"Skipping {skipped_count} video companion/workflow image(s).")
+    print(f"Scanning and sorting {len(all_files)} standalone images...")
 
     for filepath in all_files:
         filename = os.path.basename(filepath)
@@ -217,7 +245,6 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
         subject = determine_subject(filename, filepath, generic_prefixes, model)
         dest_folder = os.path.join(dest_root, subject)
         
-        # Determine strict sequential path (<Subject>_00001.ext)
         dest_path = get_next_indexed_path(dest_folder, subject, ext)
 
         if os.path.abspath(filepath) == os.path.abspath(dest_path):

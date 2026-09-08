@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import wave
+import tempfile
 import urllib.request
 import urllib.error
 import subprocess
@@ -93,7 +95,8 @@ def get_next_counter(folder_path, prefix, ext):
     os.makedirs(folder_path, exist_ok=True)
     existing = [f for f in os.listdir(folder_path) if f.lower().endswith(ext)]
     max_idx = 0
-    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.{re.escape(ext)}$", re.IGNORECASE)
+    # Matches both standard prefix_00001.ext and suffixed prefix_00001_workflow.ext
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)(?:_.*)?\.{re.escape(ext)}$", re.IGNORECASE)
     for fname in existing:
         match = pattern.match(fname)
         if match:
@@ -261,14 +264,34 @@ class SmartSaveVideo:
     CATEGORY = "video/saving"
 
     def _find_ffmpeg(self):
+        # 1. Look for imageio_ffmpeg (Bundled with ComfyUI / VideoHelperSuite)
+        try:
+            import imageio_ffmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            if ffmpeg_path and os.path.isfile(ffmpeg_path):
+                return ffmpeg_path
+        except Exception:
+            pass
+
+        # 2. System PATH check
         ffmpeg_cmd = shutil.which("ffmpeg")
         if ffmpeg_cmd:
             return ffmpeg_cmd
 
+        # 3. Known folder locations
         custom_nodes_path = os.path.dirname(SCRIPT_DIR)
-        vhs_ffmpeg = os.path.join(custom_nodes_path, "ComfyUI-VideoHelperSuite", "bin", "ffmpeg.exe")
-        if os.path.exists(vhs_ffmpeg):
-            return vhs_ffmpeg
+        comfy_root = os.path.dirname(custom_nodes_path)
+        base_dir = os.path.dirname(comfy_root)
+
+        candidates = [
+            os.path.join(base_dir, "ffmpeg", "bin", "ffmpeg.exe"),
+            os.path.join(base_dir, "ffmpeg.exe"),
+            os.path.join(comfy_root, "ffmpeg.exe"),
+        ]
+
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
 
         return "ffmpeg"
 
@@ -276,19 +299,35 @@ class SmartSaveVideo:
         if not audio_dict:
             return None
         try:
-            import torchaudio
             waveform = audio_dict.get("waveform")
             sample_rate = audio_dict.get("sample_rate", 44100)
 
             if waveform is None:
                 return None
 
-            # Squeeze batch dimension if present: [1, C, N] -> [C, N]
+            # [Batch, Channels, Samples] -> [Channels, Samples]
             if waveform.dim() == 3:
                 waveform = waveform.squeeze(0)
 
+            waveform_np = waveform.cpu().float().numpy()
+            waveform_np = np.clip(waveform_np, -1.0, 1.0)
+            int16_data = (waveform_np * 32767.0).astype(np.int16)
+
+            # Interleave channels: [Channels, Samples] -> [Samples, Channels]
+            if int16_data.ndim == 2:
+                num_channels = int16_data.shape[0]
+                interleaved = int16_data.T.flatten().tobytes()
+            else:
+                num_channels = 1
+                interleaved = int16_data.tobytes()
+
             temp_wav = os.path.join(temp_dir, "temp_audio.wav")
-            torchaudio.save(temp_wav, waveform.cpu(), sample_rate)
+            with wave.open(temp_wav, "wb") as wf:
+                wf.setnchannels(num_channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(interleaved)
+
             return temp_wav
         except Exception as e:
             print(f"[SmartSave] Failed processing audio: {e}")
@@ -345,7 +384,7 @@ class SmartSaveVideo:
         base_filename = f"{effective_prefix}_{counter:05d}"
         mp4_filename = f"{base_filename}.mp4"
         webm_filename = f"{base_filename}.webm"
-        png_filename = f"{base_filename}.png"
+        png_filename = f"{base_filename}_workflow.png"
 
         # Convert [B, H, W, C] PyTorch batch tensor to uint8 raw bytes
         frames_np = (255. * images.cpu().numpy()).clip(0, 255).astype(np.uint8)
@@ -353,10 +392,10 @@ class SmartSaveVideo:
         raw_bytes = frames_np.tobytes()
 
         ffmpeg = self._find_ffmpeg()
+        print(f"[SmartSave] Using FFmpeg binary: {ffmpeg}")
 
         # Handle optional audio export to temp WAV
         temp_audio_file = None
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp_dir:
             if audio is not None:
                 temp_audio_file = self._export_temp_audio(audio, tmp_dir)
@@ -388,8 +427,11 @@ class SmartSaveVideo:
                 ])
                 
                 process = subprocess.Popen(cmd_mp4, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                process.communicate(input=raw_bytes)
-                print(f"[SmartSave] Saved Raw Video MP4 -> {mp4_path}")
+                stdout, stderr = process.communicate(input=raw_bytes)
+                if process.returncode != 0:
+                    print(f"[SmartSave] FFmpeg MP4 Error: {stderr.decode('utf-8', errors='ignore')}")
+                else:
+                    print(f"[SmartSave] Saved Raw Video MP4 -> {mp4_path}")
 
             # 2. Encode Compressed WebM (VP9 + optional Opus)
             if save_webm:
@@ -418,8 +460,11 @@ class SmartSaveVideo:
                 ])
                 
                 process = subprocess.Popen(cmd_webm, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                process.communicate(input=raw_bytes)
-                print(f"[SmartSave] Saved Compressed WebM -> {webm_path}")
+                stdout, stderr = process.communicate(input=raw_bytes)
+                if process.returncode != 0:
+                    print(f"[SmartSave] FFmpeg WebM Error: {stderr.decode('utf-8', errors='ignore')}")
+                else:
+                    print(f"[SmartSave] Saved Compressed WebM -> {webm_path}")
 
         # 3. Save Companion Metadata PNG (First frame with workflow embedded)
         if save_metadata_png:
