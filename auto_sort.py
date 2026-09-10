@@ -47,24 +47,17 @@ def normalize_entity_name(raw_name: str) -> str:
     return "_".join(part.capitalize() for part in parts)
 
 def is_video_companion_or_protected(filepath: str) -> bool:
-    """Checks if the file is a metadata poster, inside a video directory, or paired with a video."""
     folder, filename = os.path.split(filepath)
-    
-    # 1. Skip if the file is inside a dedicated video folder
     folder_parts = {p.lower() for p in re.split(r'[\\/]', folder)}
     if folder_parts.intersection(PROTECTED_FOLDER_NAMES):
         return True
 
     base, _ = os.path.splitext(filename)
-
-    # 2. Check for matching video sibling in the same folder
-    # e.g., "Batman_00009_workflow.jpg" or "Batman_00009.png" -> check for "Batman_00009.mp4"
     clean_base = re.sub(r'(_workflow|_preview)$', '', base, flags=re.IGNORECASE)
     
     for vid_ext in VIDEO_EXTS:
-        if os.path.exists(os.path.join(folder, f"{clean_base}{vid_ext}")):
-            return True
-        if os.path.exists(os.path.join(folder, f"{base}{vid_ext}")):
+        if os.path.exists(os.path.join(folder, f"{clean_base}{vid_ext}")) or \
+           os.path.exists(os.path.join(folder, f"{base}{vid_ext}")):
             return True
 
     return False
@@ -124,17 +117,22 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
     if not prompt_text or prompt_text.strip() == "":
         return "Misc"
 
+    # Fast direct regex match for "[Actor] as [Character]"
+    actor_as_char = re.search(r'\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\s+as\s+', prompt_text)
+    if actor_as_char:
+        return normalize_entity_name(actor_as_char.group(1))
+
     short_prompt = prompt_text[:300].strip()
     if short_prompt in PROMPT_CACHE:
         return PROMPT_CACHE[short_prompt]
 
     system_instruction = (
-        "You are a file naming classifier. Extract the complete name of the FIRST subject or character mentioned in the prompt.\n"
+        "You are a file naming classifier. Extract ONLY the name of the primary specific person or character in the prompt.\n"
         "Rules:\n"
-        "1. Always include BOTH the first and last name if provided (e.g., 'Selena Gomez', not just 'Selena').\n"
-        "2. If multiple characters or subjects appear, output ONLY the first one.\n"
-        "3. Do NOT include conjunctions like 'and', 'with', or '&'.\n"
-        "4. Return ONLY the name (maximum 3 words), with zero extra words, quotes, or punctuation."
+        "1. Prioritize real actors or named characters over generic subjects like 'man', 'woman', 'guy', 'girl'.\n"
+        "2. If an actor plays a character (e.g., 'Margot Robbie as Harley Quinn'), output the actor's full name.\n"
+        "3. Always include both First and Last name if available.\n"
+        "4. Output ONLY the name (max 3 words) with no surrounding text, quotes, or punctuation."
     )
 
     try:
@@ -142,7 +140,7 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
             model=model,
             messages=[
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"Extract the full name of the first primary subject from this prompt:\n{short_prompt}"}
+                {"role": "user", "content": f"Extract the primary person's name from this prompt:\n{short_prompt}"}
             ],
             options={"temperature": 0.0},
             keep_alive="10m"
@@ -151,6 +149,10 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
         if any(bad in raw_result.lower() for bad in ["cannot", "sorry", "assist", "content", "request", "illegal", "sexual", "primary subject"]):
             subject = "Misc"
         else:
+            raw_result = raw_result.split("\n")[0].strip(" .\"'")
+            for prefix in ["the primary name is", "the name is", "name:", "the person is"]:
+                if raw_result.lower().startswith(prefix):
+                    raw_result = raw_result[len(prefix):].strip(" :.\"")
             parts = re.split(r"\s+(?:and|&|with)\s+|,|\+", raw_result, flags=re.IGNORECASE)
             cleaned = parts[0].strip() if parts else raw_result
             subject = normalize_entity_name(cleaned)
@@ -165,17 +167,21 @@ def determine_subject(filename, filepath, generic_prefixes, model):
     base_clean = re.sub(r'(_\d+)+_?.*$', '', base).replace("_", " ").strip()
     norm = base_clean.lower()
 
-    if not any(norm.startswith(p) for p in generic_prefixes) and len(base_clean) > 2:
-        return normalize_entity_name(base_clean)
+    # If the filename is an alias (e.g. "Harley_Quinn_0001"), resolve it directly
+    lookup = norm.replace(" ", "_")
+    if lookup in ALIASES:
+        return ALIASES[lookup]
 
-    prompt = extract_prompt_from_image(filepath)
-    if prompt:
-        return query_ollama(prompt, model=model)
+    # If filename is generic or unsorted, inspect metadata prompt
+    if any(norm.startswith(p) for p in generic_prefixes) or len(base_clean) <= 2:
+        prompt = extract_prompt_from_image(filepath)
+        if prompt:
+            return query_ollama(prompt, model=model)
+        return "Misc"
 
-    return "Misc"
+    return normalize_entity_name(base_clean)
 
 def get_next_indexed_path(dest_folder, subject, ext):
-    """Finds the next sequential <Subject>_00001.ext index in the destination folder."""
     os.makedirs(dest_folder, exist_ok=True)
     existing_files = os.listdir(dest_folder)
     highest_idx = 0
@@ -202,7 +208,6 @@ def safe_move(src, dst):
     return False
 
 def prune_empty_dirs(target_dir):
-    """Removes empty directories bottom-up in a platform-independent way."""
     for root, dirs, files in os.walk(target_dir, topdown=False):
         for d in dirs:
             dir_path = os.path.join(root, d)
@@ -218,7 +223,7 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(compressed_dir, exist_ok=True)
 
-    generic_prefixes = ["dai", "comfyui", "image", "raw", "compressed", "misc", "miscellaneous", "temp", "upscale"]
+    generic_prefixes = ["dai", "comfyui", "image", "raw", "compressed", "misc", "miscellaneous", "temp", "upscale", "unsorted", "selfie", "auto"]
     valid_exts = (".png", ".jpg", ".jpeg", ".webp")
 
     all_files = []
