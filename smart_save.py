@@ -48,7 +48,7 @@ def sanitize_folder_name(name):
     return clean if clean else "Unsorted"
 
 def is_refusal_or_junk(text):
-    if not text or len(text) > 35:
+    if not text or len(text) > 60:
         return True
     low = text.lower()
     return any(trig in low for trig in REFUSAL_TRIGGERS)
@@ -57,16 +57,23 @@ def get_subject_from_ollama(prompt_text, model="llama3.2:3b"):
     if not prompt_text or not prompt_text.strip():
         return "Unsorted"
 
+    # Fast direct regex match for "[Actor] as [Character]" or "as [Character]"
+    actor_as_char = re.search(r'\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\s+as\s+', prompt_text)
+    if actor_as_char:
+        return sanitize_folder_name(actor_as_char.group(1))
+
     url = "http://127.0.0.1:11434/api/generate"
     instruction = (
-        "Task: Perform named entity recognition on this text metadata. "
-        "Identify and extract ONLY the name of the real or fictional person/character mentioned. "
-        "Return just the name, nothing else. If none is found, return 'Unsorted'."
+        "Task: Identify the primary person or actor in this image description.\n"
+        "Rules:\n"
+        "1. If a real actor/person is playing a character (e.g. 'Margot Robbie as Harley Quinn'), ALWAYS return the real actor's name.\n"
+        "2. Do NOT write sentences. Return ONLY the name.\n"
+        "3. If no specific named person is found, return 'Unsorted'."
     )
 
     payload = {
         "model": model,
-        "prompt": f"{instruction}\n\nInput Metadata: \"{prompt_text}\"\nExtracted Name:",
+        "prompt": f"{instruction}\n\nPrompt: \"{prompt_text}\"\nPrimary Name:",
         "stream": False,
         "options": {"temperature": 0.0}
     }
@@ -74,10 +81,18 @@ def get_subject_from_ollama(prompt_text, model="llama3.2:3b"):
     try:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
             subject = result.get("response", "").strip()
+            
+            # Extract first line and strip common conversational LLM prefixes
             subject = subject.split("\n")[0].strip(" .\"'")
+            for prefix in [
+                "the primary name is", "the name is", "name:", 
+                "the person is", "the actor is", "the character is"
+            ]:
+                if subject.lower().startswith(prefix):
+                    subject = subject[len(prefix):].strip(" :.\"")
             
             if is_refusal_or_junk(subject):
                 return "Unsorted"
@@ -264,7 +279,6 @@ class SmartSaveVideo:
     CATEGORY = "video/saving"
 
     def _find_ffmpeg(self):
-        # 1. Look for imageio_ffmpeg (Bundled with ComfyUI / VideoHelperSuite)
         try:
             import imageio_ffmpeg
             ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
@@ -273,12 +287,10 @@ class SmartSaveVideo:
         except Exception:
             pass
 
-        # 2. System PATH check
         ffmpeg_cmd = shutil.which("ffmpeg")
         if ffmpeg_cmd:
             return ffmpeg_cmd
 
-        # 3. Known folder locations
         custom_nodes_path = os.path.dirname(SCRIPT_DIR)
         comfy_root = os.path.dirname(custom_nodes_path)
         base_dir = os.path.dirname(comfy_root)
@@ -305,7 +317,6 @@ class SmartSaveVideo:
             if waveform is None:
                 return None
 
-            # [Batch, Channels, Samples] -> [Channels, Samples]
             if waveform.dim() == 3:
                 waveform = waveform.squeeze(0)
 
@@ -313,7 +324,6 @@ class SmartSaveVideo:
             waveform_np = np.clip(waveform_np, -1.0, 1.0)
             int16_data = (waveform_np * 32767.0).astype(np.int16)
 
-            # Interleave channels: [Channels, Samples] -> [Samples, Channels]
             if int16_data.ndim == 2:
                 num_channels = int16_data.shape[0]
                 interleaved = int16_data.T.flatten().tobytes()
@@ -386,7 +396,6 @@ class SmartSaveVideo:
         webm_filename = f"{base_filename}.webm"
         png_filename = f"{base_filename}_workflow.png"
 
-        # Convert [B, H, W, C] PyTorch batch tensor to uint8 raw bytes
         frames_np = (255. * images.cpu().numpy()).clip(0, 255).astype(np.uint8)
         _, height, width, _ = frames_np.shape
         raw_bytes = frames_np.tobytes()
@@ -394,13 +403,11 @@ class SmartSaveVideo:
         ffmpeg = self._find_ffmpeg()
         print(f"[SmartSave] Using FFmpeg binary: {ffmpeg}")
 
-        # Handle optional audio export to temp WAV
         temp_audio_file = None
         with tempfile.TemporaryDirectory() as tmp_dir:
             if audio is not None:
                 temp_audio_file = self._export_temp_audio(audio, tmp_dir)
 
-            # 1. Encode Raw High-Quality MP4 (H.264 + optional AAC)
             if save_raw_mp4:
                 os.makedirs(raw_video_dir, exist_ok=True)
                 mp4_path = os.path.join(raw_video_dir, mp4_filename)
@@ -433,7 +440,6 @@ class SmartSaveVideo:
                 else:
                     print(f"[SmartSave] Saved Raw Video MP4 -> {mp4_path}")
 
-            # 2. Encode Compressed WebM (VP9 + optional Opus)
             if save_webm:
                 os.makedirs(webm_dir, exist_ok=True)
                 webm_path = os.path.join(webm_dir, webm_filename)
@@ -466,7 +472,6 @@ class SmartSaveVideo:
                 else:
                     print(f"[SmartSave] Saved Compressed WebM -> {webm_path}")
 
-        # 3. Save Companion Metadata PNG (First frame with workflow embedded)
         if save_metadata_png:
             os.makedirs(raw_video_dir, exist_ok=True)
             png_path = os.path.join(raw_video_dir, png_filename)
