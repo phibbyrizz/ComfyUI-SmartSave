@@ -10,6 +10,7 @@ import shutil
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+import piexif
 import folder_paths
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,9 @@ def sanitize_folder_name(name):
     return clean if clean else "Unsorted"
 
 def is_refusal_or_junk(text):
-    if not text or len(text) > 60:
+    if not text:
+        return True
+    if len(text) > 80:
         return True
     low = text.lower()
     return any(trig in low for trig in REFUSAL_TRIGGERS)
@@ -64,11 +67,11 @@ def get_subject_from_ollama(prompt_text, model="llama3.2:3b"):
 
     url = "http://127.0.0.1:11434/api/generate"
     instruction = (
-        "Task: Identify the primary person or actor in this image description.\n"
+        "Task: Identify the primary person, actor, or character name in this image description.\n"
         "Rules:\n"
-        "1. If a real actor/person is playing a character (e.g. 'Margot Robbie as Harley Quinn'), ALWAYS return the real actor's name.\n"
-        "2. Do NOT write sentences. Return ONLY the name.\n"
-        "3. If no specific named person is found, return 'Unsorted'."
+        "1. Return ONLY the name (e.g. 'Harley Quinn' or 'Margot Robbie').\n"
+        "2. Do NOT include descriptions, modifiers, or sentences.\n"
+        "3. If no specific named person or character is found, return 'Unsorted'."
     )
 
     payload = {
@@ -85,6 +88,20 @@ def get_subject_from_ollama(prompt_text, model="llama3.2:3b"):
             result = json.loads(response.read().decode("utf-8"))
             subject = result.get("response", "").strip()
             
+            print(f"[SmartSave Debug] Raw Ollama response: {repr(subject)}")
+            
+            # If Ollama triggers a safety refusal, catch it and fallback to local regex parsing
+            if is_refusal_or_junk(subject):
+                print(f"[SmartSave] Ollama refused or returned junk. Attempting local regex name extraction...")
+                potential_names = re.findall(r'\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\b', prompt_text)
+                if potential_names:
+                    fallback_name = potential_names[0]
+                    cleaned = sanitize_folder_name(fallback_name)
+                    if cleaned.lower() not in BLACKLIST_WORDS:
+                        print(f"[SmartSave] Local fallback successfully extracted: {cleaned}")
+                        return cleaned
+                return "Unsorted"
+            
             # Extract first line and strip common conversational LLM prefixes
             subject = subject.split("\n")[0].strip(" .\"'")
             for prefix in [
@@ -93,9 +110,6 @@ def get_subject_from_ollama(prompt_text, model="llama3.2:3b"):
             ]:
                 if subject.lower().startswith(prefix):
                     subject = subject[len(prefix):].strip(" :.\"")
-            
-            if is_refusal_or_junk(subject):
-                return "Unsorted"
             
             cleaned = sanitize_folder_name(subject)
             if cleaned.lower() in BLACKLIST_WORDS:
@@ -110,7 +124,6 @@ def get_next_counter(folder_path, prefix, ext):
     os.makedirs(folder_path, exist_ok=True)
     existing = [f for f in os.listdir(folder_path) if f.lower().endswith(ext)]
     max_idx = 0
-    # Matches both standard prefix_00001.ext and suffixed prefix_00001_workflow.ext
     pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)(?:_.*)?\.{re.escape(ext)}$", re.IGNORECASE)
     for fname in existing:
         match = pattern.match(fname)
@@ -177,8 +190,14 @@ class SmartSaveImage:
             if not target_text and prompt:
                 for node_id, node_data in prompt.items():
                     inputs = node_data.get("inputs", {})
+                    c_type = str(node_data.get("class_type", "")).lower()
+                    title = str(node_data.get("_meta", {}).get("title", "")).lower()
+                    if "neg" in c_type or "neg" in title:
+                        continue
                     if "text" in inputs and isinstance(inputs["text"], str):
-                        target_text += " " + inputs["text"]
+                        val = inputs["text"].strip()
+                        if len(val) > len(target_text):
+                            target_text = val
 
             folder_name = get_subject_from_ollama(target_text, model=ollama_model)
 
@@ -226,7 +245,19 @@ class SmartSaveImage:
                 os.makedirs(comp_dir, exist_ok=True)
                 jpg_path = os.path.join(comp_dir, jpg_filename)
                 rgb_img = img.convert("RGB") if img.mode != "RGB" else img
-                rgb_img.save(jpg_path, "JPEG", quality=jpg_quality, optimize=True)
+                
+                exif_dict = {"Exif": {}}
+                comment_content = positive_prompt if positive_prompt else target_text
+                if comment_content:
+                    user_comment_bytes = b"UNICODE\x00" + comment_content.encode("utf-16le")
+                    exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment_bytes
+
+                try:
+                    exif_bytes = piexif.dump(exif_dict)
+                    rgb_img.save(jpg_path, "JPEG", quality=jpg_quality, optimize=True, exif=exif_bytes)
+                except Exception as ex:
+                    rgb_img.save(jpg_path, "JPEG", quality=jpg_quality, optimize=True)
+
                 print(f"[SmartSave] Saved Compressed JPG -> {jpg_path}")
 
             primary_filename = png_filename if save_raw_png else jpg_filename
@@ -369,6 +400,9 @@ class SmartSaveVideo:
             if not target_text and prompt:
                 for node_id, node_data in prompt.items():
                     inputs = node_data.get("inputs", {})
+                    c_type = str(node_data.get("class_type", "")).lower()
+                    if "neg" in c_type:
+                        continue
                     if "text" in inputs and isinstance(inputs["text"], str):
                         target_text += " " + inputs["text"]
 

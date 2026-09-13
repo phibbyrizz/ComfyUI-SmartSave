@@ -15,7 +15,7 @@ VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
 PROTECTED_FOLDER_NAMES = {"video", "videos", "renders", "smartsave", "h3"}
 
 def load_aliases(script_dir):
-    """Loads aliases.json if present in the script directory or parent directory."""
+    """Loads aliases.json from the script directory or parent directory."""
     global ALIASES
     possible_paths = [
         os.path.join(script_dir, "aliases.json"),
@@ -33,7 +33,6 @@ def load_aliases(script_dir):
                 print(f"Warning: Failed to parse {path}: {e}")
 
 def normalize_entity_name(raw_name: str) -> str:
-    """Normalizes an extracted subject name to strict FirstName_LastName format."""
     cleaned = raw_name.strip()
     lookup_key = cleaned.lower().replace(" ", "_")
     
@@ -42,7 +41,7 @@ def normalize_entity_name(raw_name: str) -> str:
 
     safe = re.sub(r'[^\w\s-]', '', cleaned)
     parts = safe.split()
-    if not parts:
+    if not parts or lookup_key in {"unsorted", "misc", "miscellaneous", "none"}:
         return "Misc"
     return "_".join(part.capitalize() for part in parts)
 
@@ -62,16 +61,47 @@ def is_video_companion_or_protected(filepath: str) -> bool:
 
     return False
 
-def extract_prompt_from_image(filepath):
-    """Pulls human positive prompt text from PNG chunks or EXIF user comments."""
+def find_counterpart_by_timestamp(filepath, target_dir):
+    try:
+        file_mtime = os.path.getmtime(filepath)
+        current_dir = os.path.dirname(filepath)
+        while current_dir and os.path.basename(current_dir) not in {"output", ""}:
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            current_dir = parent
+            
+        raw_root = os.path.join(current_dir, "Raw")
+        if not os.path.exists(raw_root):
+            raw_root = os.path.abspath(os.path.join(os.path.dirname(filepath), "..", "..", "Raw"))
+
+        if os.path.exists(raw_root):
+            closest_match = None
+            smallest_diff = 2.0
+            for root, _, files in os.walk(raw_root):
+                for f in files:
+                    if f.lower().endswith(".png"):
+                        raw_path = os.path.join(root, f)
+                        raw_mtime = os.path.getmtime(raw_path)
+                        diff = abs(file_mtime - raw_mtime)
+                        if diff < smallest_diff:
+                            smallest_diff = diff
+                            closest_match = raw_path
+            return closest_match
+    except Exception:
+        pass
+    return None
+
+def extract_prompt_from_image(filepath, target_dir):
     try:
         with Image.open(filepath) as img:
             ext = os.path.splitext(filepath)[1].lower()
             if ext == ".png":
-                if "user_positive_prompt" in img.info:
-                    val = img.info["user_positive_prompt"].strip()
-                    if len(val) > 2:
-                        return val
+                for target_key in ["user_positive_prompt", "positive_prompt"]:
+                    if target_key in img.info:
+                        val = img.info[target_key].strip()
+                        if len(val) > 2:
+                            return val
 
                 for key in ["prompt", "parameters", "workflow"]:
                     if key in img.info:
@@ -90,12 +120,13 @@ def extract_prompt_from_image(filepath):
 
                                 inp = node.get("inputs", {}) if "inputs" in node else node.get("widgets_values", [])
                                 if isinstance(inp, dict):
-                                    for val in inp.values():
-                                        if isinstance(val, str) and len(val.strip()) > 4 and not val.endswith(('.safetensors', '.ckpt', '.pt')):
-                                            texts.append(val.strip())
+                                    for k, val in inp.items():
+                                        if isinstance(val, str) and len(val.strip()) > 3 and not val.endswith(('.safetensors', '.ckpt', '.pt')):
+                                            if "text" in k.lower() or "prompt" in k.lower() or len(val) > 15:
+                                                texts.append(val.strip())
                                 elif isinstance(inp, list):
                                     for val in inp:
-                                        if isinstance(val, str) and len(val.strip()) > 4 and not val.endswith(('.safetensors', '.ckpt', '.pt')):
+                                        if isinstance(val, str) and len(val.strip()) > 3 and not val.endswith(('.safetensors', '.ckpt', '.pt')):
                                             texts.append(val.strip())
                             if texts:
                                 filtered = [c for c in texts if "mannequin" not in c.lower()]
@@ -105,10 +136,18 @@ def extract_prompt_from_image(filepath):
                             return raw
             elif ext in [".jpg", ".jpeg"]:
                 if "exif" in img.info:
-                    exif_data = piexif.load(img.info["exif"])
-                    user_comment = exif_data.get("Exif", {}).get(piexif.ExifIFD.UserComment)
-                    if user_comment:
-                        return user_comment[8:].decode("utf-16le", errors="ignore") if user_comment.startswith(b"UNICODE\x00") else user_comment.decode("utf-8", errors="ignore")
+                    try:
+                        exif_data = piexif.load(img.info["exif"])
+                        user_comment = exif_data.get("Exif", {}).get(piexif.ExifIFD.UserComment)
+                        if user_comment:
+                            return user_comment[8:].decode("utf-16le", errors="ignore") if user_comment.startswith(b"UNICODE\x00") else user_comment.decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+        
+        raw_match = find_counterpart_by_timestamp(filepath, target_dir)
+        if raw_match and os.path.exists(raw_match):
+            return extract_prompt_from_image(raw_match, target_dir)
+
     except Exception:
         pass
     return ""
@@ -117,22 +156,20 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
     if not prompt_text or prompt_text.strip() == "":
         return "Misc"
 
-    # Fast direct regex match for "[Actor] as [Character]"
     actor_as_char = re.search(r'\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\s+as\s+', prompt_text)
     if actor_as_char:
         return normalize_entity_name(actor_as_char.group(1))
 
-    short_prompt = prompt_text[:300].strip()
+    short_prompt = prompt_text[:400].strip()
     if short_prompt in PROMPT_CACHE:
         return PROMPT_CACHE[short_prompt]
 
     system_instruction = (
-        "You are a file naming classifier. Extract ONLY the name of the primary specific person or character in the prompt.\n"
+        "Task: Identify the primary person, actor, or character name in this image description.\n"
         "Rules:\n"
-        "1. Prioritize real actors or named characters over generic subjects like 'man', 'woman', 'guy', 'girl'.\n"
-        "2. If an actor plays a character (e.g., 'Margot Robbie as Harley Quinn'), output the actor's full name.\n"
-        "3. Always include both First and Last name if available.\n"
-        "4. Output ONLY the name (max 3 words) with no surrounding text, quotes, or punctuation."
+        "1. If a real actor/person is playing a character (e.g. 'Margot Robbie as Harley Quinn'), ALWAYS return the real actor's name or character name clearly.\n"
+        "2. Do NOT write sentences. Return ONLY the name (max 3 words).\n"
+        "3. If no specific named person or character is found, return 'Misc'."
     )
 
     try:
@@ -140,17 +177,24 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
             model=model,
             messages=[
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"Extract the primary person's name from this prompt:\n{short_prompt}"}
+                {"role": "user", "content": f"Prompt: \"{short_prompt}\"\nPrimary Name:"}
             ],
             options={"temperature": 0.0},
             keep_alive="10m"
         )
         raw_result = response["message"]["content"].strip()
-        if any(bad in raw_result.lower() for bad in ["cannot", "sorry", "assist", "content", "request", "illegal", "sexual", "primary subject"]):
-            subject = "Misc"
+        
+        if any(bad in raw_result.lower() for bad in ["cannot", "sorry", "assist", "content", "request", "illegal", "sexual"]):
+            potential_names = re.findall(r'\b([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)*)\b', prompt_text)
+            ignore_words = {"A", "An", "The", "Cinematic", "Photo", "Portrait", "Detailed", "Masterpiece", "Raw", "Unsorted"}
+            valid_names = [n for n in potential_names if n not in ignore_words and len(n) > 2]
+            if valid_names:
+                subject = normalize_entity_name(valid_names[0])
+            else:
+                subject = "Misc"
         else:
             raw_result = raw_result.split("\n")[0].strip(" .\"'")
-            for prefix in ["the primary name is", "the name is", "name:", "the person is"]:
+            for prefix in ["the primary name is", "the name is", "name:", "the person is", "the actor is", "the character is"]:
                 if raw_result.lower().startswith(prefix):
                     raw_result = raw_result[len(prefix):].strip(" :.\"")
             parts = re.split(r"\s+(?:and|&|with)\s+|,|\+", raw_result, flags=re.IGNORECASE)
@@ -162,21 +206,25 @@ def query_ollama(prompt_text, model="llama3.2:3b"):
     PROMPT_CACHE[short_prompt] = subject
     return subject
 
-def determine_subject(filename, filepath, generic_prefixes, model):
+def determine_subject(filename, filepath, generic_prefixes, model, target_dir):
     base = os.path.splitext(filename)[0]
+    
+    parent_folder = os.path.basename(os.path.dirname(filepath)).lower()
+    in_unsorted_bucket = parent_folder in {"unsorted", "misc", "miscellaneous"}
+
     base_clean = re.sub(r'(_\d+)+_?.*$', '', base).replace("_", " ").strip()
     norm = base_clean.lower()
 
-    # If the filename is an alias (e.g. "Harley_Quinn_0001"), resolve it directly
     lookup = norm.replace(" ", "_")
     if lookup in ALIASES:
         return ALIASES[lookup]
 
-    # If filename is generic or unsorted, inspect metadata prompt
-    if any(norm.startswith(p) for p in generic_prefixes) or len(base_clean) <= 2:
-        prompt = extract_prompt_from_image(filepath)
+    if in_unsorted_bucket or any(norm.startswith(p) for p in generic_prefixes) or len(base_clean) <= 2:
+        prompt = extract_prompt_from_image(filepath, target_dir)
         if prompt:
-            return query_ollama(prompt, model=model)
+            resolved = query_ollama(prompt, model=model)
+            if resolved != "Misc":
+                return resolved
         return "Misc"
 
     return normalize_entity_name(base_clean)
@@ -238,8 +286,6 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
                     continue
                 all_files.append(full_path)
 
-    if skipped_count:
-        print(f"Skipping {skipped_count} video companion/workflow image(s).")
     print(f"Scanning and sorting {len(all_files)} standalone images...")
 
     for filepath in all_files:
@@ -247,7 +293,7 @@ def sort_directory(target_dir, model="llama3.2:3b", purge_empty=True):
         ext = os.path.splitext(filename)[1].lower()
         dest_root = raw_dir if ext == ".png" else compressed_dir
 
-        subject = determine_subject(filename, filepath, generic_prefixes, model)
+        subject = determine_subject(filename, filepath, generic_prefixes, model, target_dir)
         dest_folder = os.path.join(dest_root, subject)
         
         dest_path = get_next_indexed_path(dest_folder, subject, ext)
