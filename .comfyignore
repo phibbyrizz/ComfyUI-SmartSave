@@ -1,0 +1,5 @@
+# Development and repository-only files excluded from the Comfy Registry package
+.github/
+tests/
+.gitattributes
+.gitignore

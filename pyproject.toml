@@ -1,0 +1,18 @@
+[project]
+name = "smart-save"
+version = "1.0.0"
+description = "Automatically organize ComfyUI image and video outputs by subject using local Ollama classification, with metadata preservation and full-library Auto-Sort recovery."
+license = { file = "LICENSE" }
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[project.urls]
+Repository = "https://github.com/phibbyrizz/ComfyUI-SmartSave"
+Documentation = "https://github.com/phibbyrizz/ComfyUI-SmartSave#readme"
+"Bug Tracker" = "https://github.com/phibbyrizz/ComfyUI-SmartSave/issues"
+
+[tool.comfy]
+PublisherId = "phibbyrizz"
+DisplayName = "SmartSave"
